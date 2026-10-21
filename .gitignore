@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.env.*
+
+# Recorded data
+datacollection/
+recordings/
+outputs/
+*.mp4
+*.avi
+
+# Large datasets
+*.bag
+*.npy
+*.npz
+
+# System files
+.DS_Store
