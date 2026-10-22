@@ -103,7 +103,7 @@ def open_writer(path, fps, size):
     return writer
 
 
-def capture_realsense(args, stop, shared, lock, folder, start, errors):
+def capture_realsense(args, stop, recording, shared, lock, folder, errors):
     pipeline = rs.pipeline()
     config = rs.config()
     config.enable_stream(rs.stream.color, args.width, args.height, rs.format.bgr8, args.rgb_fps)
@@ -128,7 +128,12 @@ def capture_realsense(args, stop, shared, lock, folder, start, errors):
                 if not color:
                     continue
                 frame = np.asanyarray(color.get_data()).copy()
-                stamp = time.monotonic() - start
+                if not recording.is_set():
+                    # Countdown: keep the preview live but don't record yet.
+                    with lock:
+                        shared['image'] = frame
+                    continue
+                stamp = time.monotonic() - shared['start']
                 if writer is None:
                     h, w = frame.shape[:2]
                     writer = open_writer(folder / 'rgb.mp4', args.rgb_fps, (w, h))
@@ -164,6 +169,7 @@ def main():
     p.add_argument('--gate-mm', type=float, default=70)
     p.add_argument('--data-dir', default='datacollection')
     p.add_argument('--no-preview', action='store_true', help='Record without a live preview window')
+    p.add_argument('--countdown', type=float, default=5, help='Seconds of live preview before recording starts')
     p.add_argument('--calibration', help='camera_calibration.json; render MuJoCo from the RealSense viewpoint')
     args = p.parse_args()
     if args.vega_hz <= 0 or args.rgb_fps <= 0:
@@ -203,11 +209,11 @@ def main():
         cam.azimuth = 135
         cam.elevation = -20
 
-    stop = threading.Event()
-    shared, lock, errors = {'image': None, 'frame': -1, 'stamp': None}, threading.Lock(), []
-    start = time.monotonic()
+    stop, recording = threading.Event(), threading.Event()
+    shared, lock, errors = ({'image': None, 'frame': -1, 'stamp': None, 'start': None},
+                            threading.Lock(), [])
     rgb_thread = threading.Thread(target=capture_realsense,
-                                  args=(args, stop, shared, lock, folder, start, errors),
+                                  args=(args, stop, recording, shared, lock, folder, errors),
                                   daemon=True)
     vega = PolarisVega(host=args.host, port=args.port)
     tracking = False
@@ -243,17 +249,29 @@ def main():
                                  'detected_count', 'out_of_volume_flags_raw'])
             video_csv.writerow(['video_frame', 'vega_elapsed_s', 'rgb_frame_used', 'rgb_elapsed_s'])
             print('Live preview: press q or Ctrl+C to stop', flush=True)
+            record_at = time.monotonic() + args.countdown
+            last_count = None
             while not stop.is_set():
                 tick = time.monotonic()
+                remaining = record_at - tick
+                if remaining <= 0 and not recording.is_set():
+                    with lock:
+                        shared['start'] = tick
+                    recording.set()
+                    print('Recording started', flush=True)
+                elif remaining > 0 and math.ceil(remaining) != last_count:
+                    last_count = math.ceil(remaining)
+                    print(f'Recording in {last_count}...', flush=True)
                 points, flags = parse_tx1800(send('TX 1800'))
-                stamp = time.monotonic() - start
                 previous, next_id = assign_ids(previous, points, next_id, args.gate_mm)
-                for marker_id, (x, y, z) in sorted(previous.items()):
-                    marker_csv.writerow([index, f'{stamp:.6f}', datetime.now(timezone.utc).isoformat(),
-                                        marker_id, x, y, z, len(points), flags])
-                if not points:
-                    marker_csv.writerow([index, f'{stamp:.6f}', datetime.now(timezone.utc).isoformat(),
-                                        '', '', '', '', 0, flags])
+                if recording.is_set():
+                    stamp = time.monotonic() - shared['start']
+                    for marker_id, (x, y, z) in sorted(previous.items()):
+                        marker_csv.writerow([index, f'{stamp:.6f}', datetime.now(timezone.utc).isoformat(),
+                                            marker_id, x, y, z, len(points), flags])
+                    if not points:
+                        marker_csv.writerow([index, f'{stamp:.6f}', datetime.now(timezone.utc).isoformat(),
+                                            '', '', '', '', 0, flags])
                 for i, site_id in enumerate(sites):
                     if i < len(previous):
                         x, y, z = sorted(previous.items())[i][1]
@@ -279,6 +297,18 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX, .65, (255, 255, 255), 2)
                 cv2.putText(combined, f'MuJoCo: {len(points)} markers', (args.width + 12, 28),
                             cv2.FONT_HERSHEY_SIMPLEX, .65, (255, 255, 255), 2)
+                if not recording.is_set():
+                    if not args.no_preview:
+                        preview = combined.copy()
+                        text = f'Recording in {math.ceil(remaining)}'
+                        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 2, 4)
+                        cv2.putText(preview, text, ((preview.shape[1] - tw) // 2, (preview.shape[0] + th) // 2),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 4)
+                        cv2.imshow('RealSense RGB | MuJoCo (q to stop)', preview)
+                        if cv2.waitKey(1) & 0xFF == ord('q'):
+                            stop.set()
+                    time.sleep(max(0.0, 1 / args.vega_hz - (time.monotonic() - tick)))
+                    continue
                 mj_writer.write(mj_bgr)
                 combo_writer.write(combined)
                 video_csv.writerow([index, f'{stamp:.6f}', rgb_index,
