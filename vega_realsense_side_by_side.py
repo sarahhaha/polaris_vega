@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Record Vega 3D markers and RealSense RGB, with live side-by-side RGB/MuJoCo preview.
 
-Outputs: datacollection/<timestamp>/markers.csv, rgb.mp4, mujoco.mp4,
+Outputs: <data folder>/<timestamp>/markers.csv (see data_paths.py), rgb.mp4, mujoco.mp4,
          side_by_side.mp4, rgb_timestamps.csv, video_timestamps.csv, metadata.json.
+With --aria, also aria_rgb.mp4 and aria_rgb_timestamps.csv (and aria_vrs/*.vrs with --aria-vrs)
+from Project Aria Gen 2 glasses, shown as a third preview panel.
 
 Note: software synchronized, not hardware synchronized. MuJoCo depicts tracked
 marker positions, not a physics simulation of the chopsticks.
@@ -21,6 +23,7 @@ import mujoco
 import numpy as np
 import pyrealsense2 as rs
 
+from data_paths import DEFAULT_DATA_DIR, data_root, new_session_folder
 from vega_client import PolarisVega
 
 # Display transform (rows): Vega Y->MuJoCo X, -Z->MuJoCo Y, -X->MuJoCo Z.
@@ -167,10 +170,20 @@ def main():
     p.add_argument('--height', type=int, default=480)
     p.add_argument('--max-markers', type=int, default=16)
     p.add_argument('--gate-mm', type=float, default=70)
-    p.add_argument('--data-dir', default='datacollection')
+    p.add_argument('--data-dir', help=f'Where sessions are saved (default: $CHOPSTICKS_DATA, else {DEFAULT_DATA_DIR})')
     p.add_argument('--no-preview', action='store_true', help='Record without a live preview window')
     p.add_argument('--countdown', type=float, default=5, help='Seconds of live preview before recording starts')
     p.add_argument('--calibration', help='camera_calibration.json; render MuJoCo from the RealSense viewpoint')
+    p.add_argument('--aria', action='store_true', help='Also record the RGB camera of Aria Gen 2 glasses')
+    p.add_argument('--aria-ip', help='Glasses IP address (default: auto-discover)')
+    p.add_argument('--aria-profile', default='mp_streaming_demo',
+                   help='Streaming profile (mp_streaming_demo: 2016x1512 at 10 fps; profile9: 2560x1920 at 5 fps)')
+    p.add_argument('--aria-interface', choices=['usb', 'wifi_sta', 'wifi_sap'], default='usb')
+    p.add_argument('--aria-port', type=int, default=6768, help='Local port the glasses stream to')
+    p.add_argument('--aria-fps', type=int, default=10,
+                   help='Frame rate written into aria_rgb.mp4; match the profile. Timestamps are in the CSV')
+    p.add_argument('--aria-vrs', action='store_true',
+                   help='Also save the full Aria stream (all cameras, IMU, eye gaze, hands, VIO) to aria_vrs/')
     args = p.parse_args()
     if args.vega_hz <= 0 or args.rgb_fps <= 0:
         p.error('Frame rates must be positive')
@@ -180,11 +193,26 @@ def main():
         if (calib['width'], calib['height']) != (args.width, args.height):
             p.error(f"Calibration is for {calib['width']}x{calib['height']}, "
                     f'but recording at {args.width}x{args.height}')
+    root = data_root(args.data_dir)
 
-    folder = Path(args.data_dir).expanduser() / datetime.now().strftime('%Y%m%d_%H%M%S')
-    folder.mkdir(parents=True, exist_ok=False)
+    stop, recording = threading.Event(), threading.Event()
+    shared, lock, errors = ({'image': None, 'frame': -1, 'stamp': None, 'start': None,
+                             'aria_image': None, 'aria_frame': -1, 'aria_stamp': None},
+                            threading.Lock(), [])
+    aria = None
+    if args.aria:
+        from aria_capture import AriaCapture  # needs projectaria-client-sdk
+        aria = AriaCapture(shared, lock, recording, ip=args.aria_ip,
+                           profile=args.aria_profile, interface=args.aria_interface,
+                           port=args.aria_port, fps=args.aria_fps, vrs=args.aria_vrs)
+        try:
+            aria.connect()  # also starts streaming, so glasses that can't stream fail before any folder exists
+        except RuntimeError as exc:
+            raise SystemExit(f'{exc}\nNothing was recorded. Run without --aria to record without the glasses.')
+
+    folder = new_session_folder(root)
     print('Recording to:', folder.resolve(), flush=True)
-    (folder / 'metadata.json').write_text(json.dumps({
+    metadata = {
         'vega_host': args.host, 'vega_command': 'TX 1800',
         'vega_coordinate_units': 'mm', 'vega_hz_requested': args.vega_hz,
         'rgb_fps_requested': args.rgb_fps, 'rgb_size': [args.width, args.height],
@@ -192,7 +220,8 @@ def main():
         'note': 'Side-by-side pairs the latest RGB image with each Vega sample. '
                 'Video timestamps use the host monotonic clock; not hardware-synchronized. '
                 'Marker IDs are provisional; out-of-volume measurements are not accuracy-guaranteed.'
-    }, indent=2))
+    }
+    (folder / 'metadata.json').write_text(json.dumps(metadata, indent=2))
 
     model = make_model(args.max_markers, args.width, args.height,
                        realsense_camera_xml(calib) if calib else '')
@@ -209,9 +238,6 @@ def main():
         cam.azimuth = 135
         cam.elevation = -20
 
-    stop, recording = threading.Event(), threading.Event()
-    shared, lock, errors = ({'image': None, 'frame': -1, 'stamp': None, 'start': None},
-                            threading.Lock(), [])
     rgb_thread = threading.Thread(target=capture_realsense,
                                   args=(args, stop, recording, shared, lock, folder, errors),
                                   daemon=True)
@@ -219,6 +245,8 @@ def main():
     tracking = False
     render = None
     mj_writer = combo_writer = None
+    panels = 3 if args.aria else 2
+    window = 'RealSense RGB | MuJoCo' + (' | Aria' if args.aria else '') + ' (q to stop)'
     rgb_thread.start()
 
     def send(command):
@@ -230,6 +258,8 @@ def main():
     try:
         # The renderer is offscreen; it generates actual MuJoCo frames for the MP4.
         render = mujoco.Renderer(model, height=args.height, width=args.width)
+        if aria:
+            aria.start(folder)
         vega.connect()
         send('INIT')
         handle = send('PHRQ *********1**01')[:2]
@@ -239,7 +269,7 @@ def main():
         tracking = True
         mj_writer = open_writer(folder / 'mujoco.mp4', args.vega_hz, (args.width, args.height))
         combo_writer = open_writer(folder / 'side_by_side.mp4', args.vega_hz,
-                                   (args.width * 2, args.height))
+                                   (args.width * panels, args.height))
         previous, next_id, index = {}, 1, 0
         with (folder / 'markers.csv').open('w', newline='') as mf, \
              (folder / 'video_timestamps.csv').open('w', newline='') as vf:
@@ -247,7 +277,8 @@ def main():
             marker_csv.writerow(['vega_frame', 'host_elapsed_s', 'host_utc_iso',
                                  'marker_id', 'x_mm', 'y_mm', 'z_mm',
                                  'detected_count', 'out_of_volume_flags_raw'])
-            video_csv.writerow(['video_frame', 'vega_elapsed_s', 'rgb_frame_used', 'rgb_elapsed_s'])
+            video_csv.writerow(['video_frame', 'vega_elapsed_s', 'rgb_frame_used', 'rgb_elapsed_s']
+                               + (['aria_frame_used', 'aria_elapsed_s'] if aria else []))
             print('Live preview: press q or Ctrl+C to stop', flush=True)
             record_at = time.monotonic() + args.countdown
             last_count = None
@@ -259,6 +290,9 @@ def main():
                         shared['start'] = tick
                     recording.set()
                     print('Recording started', flush=True)
+                    if aria:
+                        metadata['aria'] = aria.info()
+                        (folder / 'metadata.json').write_text(json.dumps(metadata, indent=2))
                 elif remaining > 0 and math.ceil(remaining) != last_count:
                     last_count = math.ceil(remaining)
                     print(f'Recording in {last_count}...', flush=True)
@@ -286,17 +320,33 @@ def main():
                     rgb = shared['image']
                     rgb_index = shared['frame']
                     rgb_stamp = shared['stamp']
+                    aria_img = shared['aria_image']
+                    aria_index = shared['aria_frame']
+                    aria_stamp = shared['aria_stamp']
                 if rgb is None:
                     rgb = np.zeros((args.height, args.width, 3), dtype=np.uint8)
                     cv2.putText(rgb, 'Waiting for RealSense...', (25, 45),
                                 cv2.FONT_HERSHEY_SIMPLEX, .65, (255, 255, 255), 2)
                 else:
                     rgb = cv2.resize(rgb, (args.width, args.height))
-                combined = np.hstack((rgb, mj_bgr))
+                halves = [rgb, mj_bgr]
+                if aria:
+                    if aria_img is None:
+                        aria_panel = np.zeros((args.height, args.width, 3), dtype=np.uint8)
+                        cv2.putText(aria_panel, 'Waiting for Aria...', (25, 45),
+                                    cv2.FONT_HERSHEY_SIMPLEX, .65, (255, 255, 255), 2)
+                    else:
+                        aria_panel = cv2.resize(aria_img, (args.width, args.height),
+                                                interpolation=cv2.INTER_AREA)
+                    halves.append(aria_panel)
+                combined = np.hstack(halves)
                 cv2.putText(combined, 'RealSense RGB', (12, 28),
                             cv2.FONT_HERSHEY_SIMPLEX, .65, (255, 255, 255), 2)
                 cv2.putText(combined, f'MuJoCo: {len(points)} markers', (args.width + 12, 28),
                             cv2.FONT_HERSHEY_SIMPLEX, .65, (255, 255, 255), 2)
+                if aria:
+                    cv2.putText(combined, 'Aria RGB', (2 * args.width + 12, 28),
+                                cv2.FONT_HERSHEY_SIMPLEX, .65, (255, 255, 255), 2)
                 if not recording.is_set():
                     if not args.no_preview:
                         preview = combined.copy()
@@ -304,7 +354,7 @@ def main():
                         (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 2, 4)
                         cv2.putText(preview, text, ((preview.shape[1] - tw) // 2, (preview.shape[0] + th) // 2),
                                     cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 4)
-                        cv2.imshow('RealSense RGB | MuJoCo (q to stop)', preview)
+                        cv2.imshow(window, preview)
                         if cv2.waitKey(1) & 0xFF == ord('q'):
                             stop.set()
                     time.sleep(max(0.0, 1 / args.vega_hz - (time.monotonic() - tick)))
@@ -312,13 +362,16 @@ def main():
                 mj_writer.write(mj_bgr)
                 combo_writer.write(combined)
                 video_csv.writerow([index, f'{stamp:.6f}', rgb_index,
-                                    '' if rgb_stamp is None else f'{rgb_stamp:.6f}'])
+                                    '' if rgb_stamp is None else f'{rgb_stamp:.6f}']
+                                   + ([aria_index, '' if aria_stamp is None else f'{aria_stamp:.6f}']
+                                      if aria else []))
                 if not args.no_preview:
-                    cv2.imshow('RealSense RGB | MuJoCo (q to stop)', combined)
+                    cv2.imshow(window, combined)
                     if cv2.waitKey(1) & 0xFF == ord('q'):
                         stop.set()
                 if index % max(1, round(args.vega_hz)) == 0:
-                    print(f'Vega frame {index}: {len(points)} markers; RGB frame {rgb_index}', flush=True)
+                    print(f'Vega frame {index}: {len(points)} markers; RGB frame {rgb_index}'
+                          + (f'; Aria frame {aria_index}' if aria else ''), flush=True)
                     mf.flush()
                     vf.flush()
                 index += 1
@@ -333,6 +386,9 @@ def main():
             except Exception as exc:
                 print('TSTOP warning:', exc)
         vega.close()
+        if aria is not None:
+            aria.close()
+            print(f'Aria frames recorded: {aria.index}')
         if mj_writer is not None:
             mj_writer.release()
         if combo_writer is not None:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Polaris Vega passive stray markers + Intel RealSense RGB + MuJoCo.
 
-Outputs are placed under datacollection/<session_timestamp>/:
+Outputs are placed under <data folder>/<session_timestamp>/ (see data_paths.py):
   markers.csv, rgb.mp4, rgb_timestamps.csv, metadata.json
 
 RGB frames and Vega samples are independently timestamped using the same host
@@ -22,6 +22,7 @@ import mujoco.viewer
 import numpy as np
 import pyrealsense2 as rs
 
+from data_paths import DEFAULT_DATA_DIR, data_root, new_session_folder
 from vega_client import PolarisVega
 
 
@@ -161,15 +162,14 @@ def main():
     parser.add_argument('--height', type=int, default=480)
     parser.add_argument('--max-markers', type=int, default=16)
     parser.add_argument('--gate-mm', type=float, default=70)
-    parser.add_argument('--data-dir', default='datacollection')
+    parser.add_argument('--data-dir', help=f'Where sessions are saved (default: $CHOPSTICKS_DATA, else {DEFAULT_DATA_DIR})')
     parser.add_argument('--show-rgb', action='store_true', help='Show an RGB preview window')
     parser.add_argument('--no-mujoco', action='store_true', help='Record without the MuJoCo window')
     args = parser.parse_args()
     if args.vega_hz <= 0 or args.rgb_fps <= 0 or args.max_markers <= 0:
         parser.error('Rates and max-markers must be positive')
 
-    session_dir = Path(args.data_dir).expanduser() / datetime.now().strftime('%Y%m%d_%H%M%S')
-    session_dir.mkdir(parents=True, exist_ok=False)
+    session_dir = new_session_folder(data_root(args.data_dir))
     (session_dir / 'metadata.json').write_text(json.dumps({
         'camera': 'Intel RealSense color', 'vega_host': args.host,
         'vega_command': 'TX 1800', 'vega_units': 'millimeters',
